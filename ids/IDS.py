@@ -363,7 +363,8 @@ class NIDS:
             and src_port is not None
             and src_port > 1024
         ):
-            return
+            if dst_port not in SUSPICIOUS_PORTS and not self.is_protected_target(dst_ip):
+                return
 
         if IGNORE_PRIVATE_TO_PRIVATE and is_local_ip(src_ip) and is_local_ip(dst_ip):
             if not self.is_protected_target(dst_ip):
