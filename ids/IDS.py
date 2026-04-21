@@ -10,7 +10,7 @@ from typing import Deque
 
 import requests
 from dotenv import load_dotenv
-from scapy.all import IP, TCP, sniff
+from scapy.all import IP, TCP, Raw, sniff
 
 load_dotenv()
 
@@ -23,7 +23,10 @@ def _read_csv(name: str, default: str = "") -> set[str]:
 def _read_int_csv(name: str, default: str = "") -> set[int]:
     values = set()
     for item in _read_csv(name, default):
-        values.add(int(item))
+        try:
+            values.add(int(item))
+        except ValueError:
+            pass
     return values
 
 
@@ -32,15 +35,21 @@ def _read_bool(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-MALICIOUS_IPS = _read_csv("MALICIOUS_IPS", "192.168.1.100")
-SUSPICIOUS_PORTS = _read_int_csv("SUSPICIOUS_PORTS", "4444,31337")
+MALICIOUS_IPS = _read_csv("MALICIOUS_IPS", "141.98.11.11,198.51.100.99")
+SUSPICIOUS_PORTS = _read_int_csv("SUSPICIOUS_PORTS", "4444,31337,4445")
 TRUSTED_IPS = _read_csv("TRUSTED_IPS", "8.8.8.8,1.1.1.1")
 
-ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", "25"))
+PROTECTED_HOSTS = _read_csv("PROTECTED_HOSTS", "")
+HTTP_PORTS = _read_int_csv("HTTP_PORTS", "80,8080,8000")
+HTTPS_PORTS = _read_int_csv("HTTPS_PORTS", "443,8443")
+
+ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", "15"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "5"))
 
-PORT_SCAN_THRESHOLD = int(os.getenv("PORT_SCAN_THRESHOLD", "30"))
+PORT_SCAN_THRESHOLD = int(os.getenv("PORT_SCAN_THRESHOLD", "10"))
 PORT_SCAN_WINDOW = int(os.getenv("PORT_SCAN_WINDOW", "10"))
+
+IGNORE_PRIVATE_TO_PRIVATE = _read_bool("IGNORE_PRIVATE_TO_PRIVATE", False)
 
 ENABLE_AUTO_BLOCK = _read_bool("ENABLE_AUTO_BLOCK", False)
 AUTO_BLOCK_ON = os.getenv("AUTO_BLOCK_ON", "CRITICAL").strip().upper()
@@ -53,6 +62,9 @@ LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/app/logs/alerts.json")
 BLOCKED_IPS_PATH = os.getenv("BLOCKED_IPS_PATH", "/app/logs/blocked_ips.json")
 GEO_API_URL = os.getenv("GEO_API_URL", "http://ip-api.com/json")
 SNIFF_IFACES_RAW = os.getenv("SNIFF_IFACES", "")
+
+# prevents one attack from creating hundreds of duplicate alerts
+ATTACK_COOLDOWN = int(os.getenv("ATTACK_COOLDOWN", "15"))
 
 os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(BLOCKED_IPS_PATH), exist_ok=True)
@@ -162,12 +174,13 @@ class JSONFileLogger:
 
 class NIDS:
     def __init__(self) -> None:
-        self.ip_traffic: defaultdict[str, Deque[float]] = defaultdict(deque)
-        self.scanned_ports: defaultdict[str, Deque[tuple[float, int]]] = defaultdict(deque)
+        self.ip_traffic: defaultdict[tuple[str, str, int], Deque[float]] = defaultdict(deque)
+        self.scanned_ports: defaultdict[tuple[str, str], Deque[tuple[float, int]]] = defaultdict(deque)
         self.geo_cache: dict[str, str] = {}
         self.abuse_cache: dict[str, bool] = {}
         self.blocked_ips: set[str] = set()
         self.last_alert_time: defaultdict[tuple[str, str], float] = defaultdict(float)
+        self.active_attacks: dict[tuple[str, str, int | None, str], float] = {}
         self.logger = JSONFileLogger(LOG_FILE_PATH)
         self._load_blocked_ips()
 
@@ -188,6 +201,32 @@ class NIDS:
                 json.dump(sorted(self.blocked_ips), file, indent=2)
         except Exception as exc:
             print(f"[ERROR] failed to save blocked IPs: {exc}")
+
+    def is_protected_target(self, ip: str) -> bool:
+        if PROTECTED_HOSTS:
+            return ip in PROTECTED_HOSTS
+        return is_self_ip(ip)
+
+    def looks_like_http(self, packet) -> bool:
+        if not packet.haslayer(Raw):
+            return False
+        try:
+            payload = packet[Raw].load.decode(errors="ignore").upper()
+        except Exception:
+            return False
+
+        methods = ("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ")
+        return payload.startswith(methods) or "HTTP/" in payload
+
+    def should_alert_once(self, src_ip: str, dst_ip: str, dst_port: int | None, attack_type: str, now: float) -> bool:
+        key = (src_ip, dst_ip, dst_port, attack_type)
+        last_seen = self.active_attacks.get(key, 0.0)
+
+        if now - last_seen < ATTACK_COOLDOWN:
+            return False
+
+        self.active_attacks[key] = now
+        return True
 
     def get_geo(self, ip: str) -> str:
         if is_local_ip(ip):
@@ -293,13 +332,6 @@ class NIDS:
             details={"reason": reason},
         )
 
-    def _classify_anomaly(self, dst_port: int | None) -> str:
-        if dst_port == 22:
-            return "SSH Brute Force"
-        if dst_port in (80, 443):
-            return "HTTP Flood"
-        return "Brute Force / DoS"
-
     def analyze_packet(self, packet) -> None:
         if not packet.haslayer(IP):
             return
@@ -307,15 +339,12 @@ class NIDS:
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
 
-        # Ignore trusted IPs
         if is_trusted_ip(src_ip) or is_trusted_ip(dst_ip):
             return
 
-        # Ignore self traffic only
         if is_self_ip(src_ip) and is_self_ip(dst_ip):
             return
 
-        # Ignore Docker / virtualization noisy traffic only
         noisy_prefixes = ("172.17.", "172.18.", "172.19.", "192.168.65.")
         if src_ip.startswith(noisy_prefixes) and dst_ip.startswith(noisy_prefixes):
             return
@@ -323,11 +352,9 @@ class NIDS:
         src_port = packet[TCP].sport if packet.haslayer(TCP) else None
         dst_port = packet[TCP].dport if packet.haslayer(TCP) else None
 
-        # Ignore broadcast destination chatter
         if dst_ip == "255.255.255.255":
             return
 
-        # Ignore same-host repeated local service chatter on random high ports
         if (
             is_local_ip(src_ip)
             and is_local_ip(dst_ip)
@@ -338,7 +365,10 @@ class NIDS:
         ):
             return
 
-        # If blocked IP seen again
+        if IGNORE_PRIVATE_TO_PRIVATE and is_local_ip(src_ip) and is_local_ip(dst_ip):
+            if not self.is_protected_target(dst_ip):
+                return
+
         if src_ip in self.blocked_ips or dst_ip in self.blocked_ips:
             blocked_ip = src_ip if src_ip in self.blocked_ips else dst_ip
             geo = self.get_geo(blocked_ip)
@@ -360,44 +390,74 @@ class NIDS:
         local_detected = False
         now = time.time()
 
-        # Local blocklist
         if src_ip in MALICIOUS_IPS:
             reasons.append("Source IP present in local blocklist")
             attack_type = "Malicious IP"
             local_detected = True
 
-        # Suspicious ports
         if dst_port in SUSPICIOUS_PORTS or src_port in SUSPICIOUS_PORTS:
             reasons.append("Suspicious port usage")
             attack_type = "Suspicious Port"
             local_detected = True
 
-        # Traffic anomaly
-        self.ip_traffic[src_ip].append(now)
-        while self.ip_traffic[src_ip] and self.ip_traffic[src_ip][0] < now - RATE_LIMIT_WINDOW:
-            self.ip_traffic[src_ip].popleft()
-
-        ip_count = len(self.ip_traffic[src_ip])
-
-        # Only classify anomaly if traffic is meaningful
-        if ip_count > ANOMALY_THRESHOLD:
-            # Better anomaly labeling
-            if dst_port in (80, 443):
-                reasons.append(f"High traffic anomaly from IP (> {ANOMALY_THRESHOLD} in {RATE_LIMIT_WINDOW}s)")
-                attack_type = "HTTP Flood"
-                local_detected = True
-            elif dst_port == 22:
-                reasons.append(f"High traffic anomaly from IP (> {ANOMALY_THRESHOLD} in {RATE_LIMIT_WINDOW}s)")
-                attack_type = "SSH Brute Force"
-                local_detected = True
-            elif dst_port is not None and dst_port < 1024:
-                reasons.append(f"High traffic anomaly from IP (> {ANOMALY_THRESHOLD} in {RATE_LIMIT_WINDOW}s)")
-                attack_type = "Brute Force / DoS"
-                local_detected = True
-
-        # Port scan detection with cooldown
+        ip_count = 0
         if dst_port is not None:
-            history = self.scanned_ports[src_ip]
+            traffic_key = (src_ip, dst_ip, dst_port)
+            self.ip_traffic[traffic_key].append(now)
+
+            while self.ip_traffic[traffic_key] and self.ip_traffic[traffic_key][0] < now - RATE_LIMIT_WINDOW:
+                self.ip_traffic[traffic_key].popleft()
+
+            ip_count = len(self.ip_traffic[traffic_key])
+
+        is_incoming_to_protected = self.is_protected_target(dst_ip)
+        is_http_port = dst_port in HTTP_PORTS if dst_port is not None else False
+        is_https_port = dst_port in HTTPS_PORTS if dst_port is not None else False
+
+        # anomaly / flood detection with cooldown
+        if ip_count > ANOMALY_THRESHOLD and is_incoming_to_protected:
+            candidate_attack = None
+            candidate_reason = None
+
+            if is_http_port:
+                if self.looks_like_http(packet):
+                    candidate_attack = "HTTP Flood"
+                    candidate_reason = (
+                        f"Possible HTTP flood: {ip_count} packets to protected web service in {RATE_LIMIT_WINDOW}s"
+                    )
+                else:
+                    candidate_attack = "Brute Force / DoS"
+                    candidate_reason = (
+                        f"High-rate traffic to protected web port ({ip_count} packets in {RATE_LIMIT_WINDOW}s)"
+                    )
+
+            elif is_https_port:
+                candidate_attack = "Brute Force / DoS"
+                candidate_reason = (
+                    f"Suspicious HTTPS traffic spike to protected host ({ip_count} packets in {RATE_LIMIT_WINDOW}s)"
+                )
+
+            elif dst_port == 22:
+                candidate_attack = "SSH Brute Force"
+                candidate_reason = (
+                    f"High traffic anomaly to SSH service (> {ANOMALY_THRESHOLD} in {RATE_LIMIT_WINDOW}s)"
+                )
+
+            elif dst_port is not None and dst_port < 1024:
+                candidate_attack = "Brute Force / DoS"
+                candidate_reason = (
+                    f"High traffic anomaly to protected service (> {ANOMALY_THRESHOLD} in {RATE_LIMIT_WINDOW}s)"
+                )
+
+            if candidate_attack and candidate_reason:
+                if self.should_alert_once(src_ip, dst_ip, dst_port, candidate_attack, now):
+                    reasons.append(candidate_reason)
+                    attack_type = candidate_attack
+                    local_detected = True
+
+        # port scan detection with cooldown
+        if dst_port is not None and is_incoming_to_protected:
+            history = self.scanned_ports[(src_ip, dst_ip)]
             history.append((now, dst_port))
 
             while history and history[0][0] < now - PORT_SCAN_WINDOW:
@@ -405,15 +465,13 @@ class NIDS:
 
             unique_ports = {port for _, port in history}
 
-            # cooldown key
-            scan_key = (src_ip, "portscan")
-            if len(unique_ports) >= PORT_SCAN_THRESHOLD and now - self.last_alert_time[scan_key] > 15:
-                reasons.append(
-                    f"Port scan detected ({len(unique_ports)} unique ports in {PORT_SCAN_WINDOW}s)"
-                )
-                attack_type = "Port Scan"
-                local_detected = True
-                self.last_alert_time[scan_key] = now
+            if len(unique_ports) >= PORT_SCAN_THRESHOLD:
+                if self.should_alert_once(src_ip, dst_ip, None, "Port Scan", now):
+                    reasons.append(
+                        f"Port scan detected ({len(unique_ports)} unique ports in {PORT_SCAN_WINDOW}s)"
+                    )
+                    attack_type = "Port Scan"
+                    local_detected = True
 
         if not local_detected:
             return
@@ -426,10 +484,12 @@ class NIDS:
         if attack_type in {"Port Scan", "SSH Brute Force", "HTTP Flood", "Suspicious Port"}:
             severity = "HIGH"
 
+        if attack_type == "Brute Force / DoS":
+            severity = "MEDIUM"
+
         if attack_type == "Malicious IP":
             severity = "CRITICAL"
 
-        # Reputation check only for non-local source IP
         if not is_local_ip(src_ip) and self.check_api(src_ip):
             reasons.append(f"AbuseIPDB score >= {ABUSE_SCORE_THRESHOLD}")
             severity = "CRITICAL"
@@ -463,6 +523,8 @@ def start_nids() -> None:
     print("🚀 NIDS Started")
     print(f"Logging to: {LOG_FILE_PATH}")
     print(f"Interfaces: {SNIFF_IFACES if SNIFF_IFACES else 'all available interfaces'}")
+    print(f"Protected hosts: {PROTECTED_HOSTS if PROTECTED_HOSTS else 'self IPs only'}")
+    print(f"Attack cooldown: {ATTACK_COOLDOWN}s")
     print(f"Auto block enabled: {ENABLE_AUTO_BLOCK} ({AUTO_BLOCK_ON})")
     print("Press Ctrl+C to stop\n")
 
