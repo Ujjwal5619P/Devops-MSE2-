@@ -1,0 +1,23 @@
+name: DevSecOps IDS CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout latest code
+        uses: actions/checkout@v4
+
+      - name: Go to project folder and deploy
+        run: |
+          cd fixed_project
+          docker compose down || true
+          docker compose up --build -d
+
+      - name: Verify containers
+        run: docker ps
